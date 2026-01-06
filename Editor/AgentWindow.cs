@@ -48,6 +48,7 @@ namespace UnityAgentClient
         int selectedModelIndexSnapshot;
         string[] availableModesSnapshot = Array.Empty<string>();
         int selectedModeIndexSnapshot;
+        AvailableCommand[] availableCommandsSnapshot = Array.Empty<AvailableCommand>();
 
         // <think> tag splitting for agents that embed thinking inside normal message chunks.
         const string ThinkTagOpen = "<think>";
@@ -78,6 +79,9 @@ namespace UnityAgentClient
         // Mode management
         string[] availableModes = Array.Empty<string>();
         int selectedModeIndex;
+
+        // Slash commands (ACP available_commands_update)
+        AvailableCommand[] availableCommands = Array.Empty<AvailableCommand>();
 
         // Permission management
         RequestPermissionRequest pendingPermissionRequest;
@@ -113,6 +117,7 @@ namespace UnityAgentClient
             window.selectedModelIndex = 0;
             window.availableModes = Array.Empty<string>();
             window.selectedModeIndex = 0;
+            window.availableCommands = Array.Empty<AvailableCommand>();
             window.pendingPermissionRequest = null;
             window.pendingPermissionTcs = null;
             window.pendingAuthMethods = null;
@@ -352,10 +357,25 @@ namespace UnityAgentClient
 
                 messages.Clear();
                 messages.AddRange(restored);
+
+                RebuildDerivedStateFromMessages();
             }
             catch
             {
                 // ignore
+            }
+        }
+
+        void RebuildDerivedStateFromMessages()
+        {
+            // Restore latest available commands so slash completion works even after domain reload.
+            for (int i = messages.Count - 1; i >= 0; i--)
+            {
+                if (messages[i] is AvailableCommandsUpdateSessionUpdate cmds && cmds.AvailableCommands != null)
+                {
+                    availableCommands = cmds.AvailableCommands;
+                    break;
+                }
             }
         }
 
@@ -953,6 +973,7 @@ namespace UnityAgentClient
             selectedModelIndexSnapshot = selectedModelIndex;
             availableModesSnapshot = availableModes;
             selectedModeIndexSnapshot = selectedModeIndex;
+            availableCommandsSnapshot = availableCommands;
         }
 
         string GetToolCallHeader(ToolCallSessionUpdate update)
@@ -1028,7 +1049,16 @@ namespace UnityAgentClient
                 {
                     // Enter without shift - send message
                     evt.Use();
-                    SendRequestAsync().Forget();
+                    var userText = inputText;
+                    var attachmentsSnapshot = attachedAssets.Where(a => a != null).ToArray();
+
+                    // Clear input immediately for better UX (actual sending uses captured text).
+                    inputText = string.Empty;
+                    attachedAssets.Clear();
+                    GUI.changed = true;
+                    Repaint();
+
+                    SendRequestAsync(userText, attachmentsSnapshot).Forget();
                     return;
                 }
                 // Shift+Enter - let it insert newline naturally
@@ -1049,6 +1079,75 @@ namespace UnityAgentClient
                 GUILayout.ExpandHeight(true),
                 GUILayout.ExpandWidth(true));
             EditorGUILayout.EndScrollView();
+
+            DrawSlashCommandSuggestions();
+        }
+
+        void DrawSlashCommandSuggestions()
+        {
+            if (string.IsNullOrWhiteSpace(inputText)) return;
+            if (!inputText.StartsWith("/")) return;
+
+            if (availableCommandsSnapshot == null || availableCommandsSnapshot.Length == 0)
+            {
+                using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+                {
+                    EditorGUILayout.LabelField("Slash commands", EditorStyles.boldLabel);
+                    EditorGUILayout.LabelField("No commands received from agent yet. Try typing /help.", EditorStyles.miniLabel);
+                    if (GUILayout.Button("Insert /help", EditorStyles.miniButton, GUILayout.Width(120)))
+                    {
+                        inputText = "/help";
+                        shouldFocusInput = true;
+                    }
+                }
+                return;
+            }
+
+            // Filter by first token after "/"
+            var token = inputText.TrimStart().Substring(1);
+            var firstToken = token.Split(new[] { ' ', '\t', '\n', '\r' }, 2)[0];
+            var query = firstToken ?? string.Empty;
+
+            var matches = availableCommandsSnapshot
+                .Where(c => c != null && !string.IsNullOrWhiteSpace(c.Name))
+                .Select(c =>
+                {
+                    var name = c.Name.Trim();
+                    var normalized = name.StartsWith("/") ? name : "/" + name;
+                    return (cmd: c, name: normalized);
+                })
+                .Where(x => string.IsNullOrEmpty(query) || x.name.StartsWith("/" + query, StringComparison.OrdinalIgnoreCase))
+                .Take(8)
+                .ToArray();
+
+            if (matches.Length == 0) return;
+
+            using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+            {
+                EditorGUILayout.LabelField("Slash commands", EditorStyles.boldLabel);
+
+                foreach (var m in matches)
+                {
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        if (GUILayout.Button(m.name, EditorStyles.miniButtonLeft, GUILayout.Width(160)))
+                        {
+                            // Insert command into input; if command expects input, add a trailing space.
+                            var needsInput = m.cmd.Input != null;
+                            inputText = needsInput ? (m.name + " ") : m.name;
+                            shouldFocusInput = true;
+                        }
+
+                        var desc = string.IsNullOrWhiteSpace(m.cmd.Description) ? "" : m.cmd.Description.Trim();
+                        EditorGUILayout.LabelField(desc, EditorStyles.miniLabel);
+                    }
+
+                    if (m.cmd.Input != null && !string.IsNullOrWhiteSpace(m.cmd.Input.Hint))
+                    {
+                        EditorGUILayout.LabelField($"Hint: {m.cmd.Input.Hint}", EditorStyles.miniLabel);
+                    }
+                }
+            }
         }
 
         void DrawMessage(SessionUpdate update, int index)
@@ -1251,7 +1350,7 @@ namespace UnityAgentClient
             using (new EditorGUILayout.VerticalScope(GUI.skin.box))
             {
                 var key = $"available_commands:{index}";
-                foldoutStates.TryAdd(key, false);
+                foldoutStates.TryAdd(key, true);
 
                 var foldout = EditorGUILayout.Foldout(foldoutStates[key], "Available Commands", true);
                 if (foldout)
@@ -1260,7 +1359,18 @@ namespace UnityAgentClient
 
                     foreach (var cmd in update.AvailableCommands)
                     {
-                        EditorGUILayout.LabelField($"{cmd.Name} - {cmd.Description}", EditorStyles.wordWrappedLabel);
+                        using (new EditorGUILayout.HorizontalScope())
+                        {
+                            var name = cmd.Name?.Trim() ?? "";
+                            var normalized = name.StartsWith("/") ? name : "/" + name;
+                            if (GUILayout.Button(normalized, EditorStyles.miniButtonLeft, GUILayout.Width(180)))
+                            {
+                                inputText = cmd.Input != null ? (normalized + " ") : normalized;
+                                shouldFocusInput = true;
+                            }
+
+                            EditorGUILayout.LabelField(cmd.Description ?? "", EditorStyles.miniLabel);
+                        }
                     }
                 }
 
@@ -1492,10 +1602,10 @@ namespace UnityAgentClient
             return result;
         }
 
-        async Task SendRequestAsync(CancellationToken cancellationToken = default)
+        async Task SendRequestAsync(string userText, UnityEngine.Object[] attachmentsSnapshot, CancellationToken cancellationToken = default)
         {
             if (conn == null || string.IsNullOrEmpty(sessionId)) return;
-            if (string.IsNullOrWhiteSpace(inputText)) return;
+            if (string.IsNullOrWhiteSpace(userText)) return;
 
             operationCts?.Cancel();
             operationCts?.Dispose();
@@ -1504,8 +1614,8 @@ namespace UnityAgentClient
             isRunning = true;
             try
             {
-                var userText = inputText;
                 var historyContext = shouldInjectHistoryIntoPrompts ? BuildHistoryContextForPrompt() : null;
+                attachmentsSnapshot ??= Array.Empty<UnityEngine.Object>();
 
                 // Add user message
                 messages.Add(new UserMessageChunkSessionUpdate
@@ -1525,7 +1635,7 @@ namespace UnityAgentClient
                 promptBlocks.RemoveAll(b => b == null);
 
                 // Add attached assets as resource links
-                foreach (var asset in attachedAssets)
+                foreach (var asset in attachmentsSnapshot)
                 {
                     if (asset == null) continue;
 
@@ -1572,9 +1682,6 @@ namespace UnityAgentClient
                     SessionId = sessionId,
                     Prompt = promptBlocks.ToArray(),
                 };
-
-                inputText = "";
-                attachedAssets.Clear(); // Clear attachments after sending
 
                 try
                 {
@@ -1796,6 +1903,10 @@ namespace UnityAgentClient
                     break;
                 case ToolCallUpdateSessionUpdate toolCallUpdate:
                     ApplyToolCallUpdate(toolCallUpdate);
+                    break;
+                case AvailableCommandsUpdateSessionUpdate cmds:
+                    availableCommands = cmds.AvailableCommands ?? Array.Empty<AvailableCommand>();
+                    messages.Add(cmds); // keep visible in transcript as well
                     break;
                 default:
                     messages.Add(update);
