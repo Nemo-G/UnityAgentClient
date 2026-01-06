@@ -61,6 +61,9 @@ namespace UnityAgentClient
         string sessionId;
         ClientSideConnection conn;
         Process agentProcess;
+        StreamReader agentStdoutReader;
+        StreamWriter agentStdinWriter;
+        StreamReader agentStderrReader;
 
         CancellationTokenSource connectionCts;
         CancellationTokenSource operationCts;
@@ -118,7 +121,7 @@ namespace UnityAgentClient
             window.Show();
         }
 
-        void Disconnect()
+        void Disconnect(bool killAgentProcess = true)
         {
             // This method is invoked by Unity on domain reload (beforeAssemblyReload), editor quit, and when the window closes.
             // It must be best-effort and never leave the window in a "running" state.
@@ -224,7 +227,7 @@ namespace UnityAgentClient
             {
                 try
                 {
-                    if (!agentProcess.HasExited)
+                    if (killAgentProcess && !agentProcess.HasExited)
                     {
                         agentProcess.Kill();
                     }
@@ -245,16 +248,16 @@ namespace UnityAgentClient
                     }
 
                     agentProcess = null;
+                    agentStdoutReader = null;
+                    agentStdinWriter = null;
+                    agentStderrReader = null;
                 }
 
-                Logger.LogVerbose("Disconnected");
+                Logger.LogVerbose(killAgentProcess ? "Disconnected" : "Disconnected (agent kept running)");
             }
 
             // Reset UI state so we don't get stuck in "Connecting..." forever.
             connectionStatus = ConnectionStatus.Pending;
-
-            AssemblyReloadEvents.beforeAssemblyReload -= HandleBeforeAssemblyReload;
-            EditorApplication.quitting -= HandleEditorQuitting;
         }
 
         void OnInspectorUpdate()
@@ -290,34 +293,42 @@ namespace UnityAgentClient
 
             // Restore UI history across domain reloads so the conversation doesn't disappear.
             TryRestoreHistoryFromPersistence();
+
+            // If we kept the agent process alive across domain reload, reattach to its stdio so the ACP session continues.
+            TryRestoreLiveTransportFromPersistence();
         }
 
         void OnDisable()
         {
+            // Ensure we don't leave stale subscriptions around when the window is closed/disabled.
+            AssemblyReloadEvents.beforeAssemblyReload -= HandleBeforeAssemblyReload;
+            EditorApplication.quitting -= HandleEditorQuitting;
+
             // OnDisable is called for both domain reload and window close.
             // During domain reload we already snapshot state in beforeAssemblyReload.
             if (isDomainReloading)
             {
-                Disconnect();
+                Disconnect(killAgentProcess: false);
                 return;
             }
 
             // Window closed explicitly: still persist a snapshot so reopening keeps history.
             TryPersistSnapshot();
-            Disconnect();
+            Disconnect(killAgentProcess: true);
         }
 
         void HandleBeforeAssemblyReload()
         {
             isDomainReloading = true;
             TryPersistSnapshot();
-            Disconnect();
+            TryPersistLiveTransportForDomainReload();
+            Disconnect(killAgentProcess: false);
         }
 
         void HandleEditorQuitting()
         {
             TryPersistSnapshot();
-            Disconnect();
+            Disconnect(killAgentProcess: true);
         }
 
         void TryPersistSnapshot()
@@ -346,6 +357,189 @@ namespace UnityAgentClient
             {
                 // ignore
             }
+        }
+
+        const int JsonRpcMethodNotFoundCode = -32601;
+
+        static int GenerateRequestIdSeed()
+        {
+            // Large positive seed to avoid collisions with any outstanding JSON-RPC responses after domain reload.
+            var seed = (int)(DateTimeOffset.UtcNow.ToUnixTimeSeconds() & 0x7fffffff);
+            return seed < 1024 ? seed + 1024 : seed;
+        }
+
+        void TryPersistLiveTransportForDomainReload()
+        {
+#if UNITY_EDITOR_WIN
+            try
+            {
+                if (agentProcess == null)
+                {
+                    Logger.LogVerbose("No agent process; skipping live transport persistence.");
+                    return;
+                }
+
+                if (agentProcess.HasExited)
+                {
+                    Logger.LogVerbose("Agent process already exited; skipping live transport persistence.");
+                    return;
+                }
+
+                if (agentStdoutReader == null || agentStdinWriter == null)
+                {
+                    Logger.LogVerbose("Missing stdio streams; skipping live transport persistence.");
+                    return;
+                }
+
+                // Avoid leaking old duplicated handles if a previous reload restore failed.
+                if (AgentSessionPersistence.TryGetLiveTransport(out _, out var oldStdin, out var oldStdout, out var oldStderr, out _))
+                {
+                    Win32HandleUtil.CloseHandleIfValid(oldStdin);
+                    Win32HandleUtil.CloseHandleIfValid(oldStdout);
+                    Win32HandleUtil.CloseHandleIfValid(oldStderr);
+                    AgentSessionPersistence.ClearLiveTransport();
+                }
+
+                var stdinStream = agentStdinWriter.BaseStream;
+                var stdoutStream = agentStdoutReader.BaseStream;
+                var stderrStream = agentStderrReader?.BaseStream;
+
+                if (!Win32HandleUtil.TryDuplicateStreamHandle(stdinStream, out var stdinDup, out var stdinErr))
+                {
+                    Logger.LogWarning($"Failed to duplicate stdin handle (type={stdinStream?.GetType().FullName ?? "(null)"}, err={stdinErr}).");
+                    return;
+                }
+
+                if (!Win32HandleUtil.TryDuplicateStreamHandle(stdoutStream, out var stdoutDup, out var stdoutErr))
+                {
+                    Win32HandleUtil.CloseHandleIfValid(stdinDup);
+                    Logger.LogWarning($"Failed to duplicate stdout handle (type={stdoutStream?.GetType().FullName ?? "(null)"}, err={stdoutErr}).");
+                    return;
+                }
+
+                if (stderrStream == null)
+                {
+                    Win32HandleUtil.CloseHandleIfValid(stdinDup);
+                    Win32HandleUtil.CloseHandleIfValid(stdoutDup);
+                    Logger.LogWarning("Failed to duplicate stderr handle (stream is null).");
+                    return;
+                }
+
+                if (!Win32HandleUtil.TryDuplicateStreamHandle(stderrStream, out var stderrDup, out var stderrErr))
+                {
+                    Win32HandleUtil.CloseHandleIfValid(stdinDup);
+                    Win32HandleUtil.CloseHandleIfValid(stdoutDup);
+                    Logger.LogWarning($"Failed to duplicate stderr handle (type={stderrStream.GetType().FullName}, err={stderrErr}).");
+                    return;
+                }
+
+                var seed = GenerateRequestIdSeed();
+                AgentSessionPersistence.SaveLiveTransport(agentProcess.Id, stdinDup, stdoutDup, stderrDup, seed);
+                Logger.LogVerbose($"Persisted live transport for domain reload (pid={agentProcess.Id}, seed={seed}).");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning($"Failed to persist live transport: {ex.Message}");
+            }
+#endif
+        }
+
+        void TryRestoreLiveTransportFromPersistence()
+        {
+#if UNITY_EDITOR_WIN
+            try
+            {
+                if (conn != null) return;
+
+                if (!AgentSessionPersistence.TryGetLiveTransport(out var pid, out var stdinHandle, out var stdoutHandle, out var stderrHandle, out var requestIdSeed))
+                {
+                    return;
+                }
+
+                Process p = null;
+                try
+                {
+                    p = Process.GetProcessById(pid);
+                }
+                catch
+                {
+                    Win32HandleUtil.CloseHandleIfValid(stdinHandle);
+                    Win32HandleUtil.CloseHandleIfValid(stdoutHandle);
+                    Win32HandleUtil.CloseHandleIfValid(stderrHandle);
+                    AgentSessionPersistence.ClearLiveTransport();
+                    return;
+                }
+
+                if (p.HasExited)
+                {
+                    Win32HandleUtil.CloseHandleIfValid(stdinHandle);
+                    Win32HandleUtil.CloseHandleIfValid(stdoutHandle);
+                    Win32HandleUtil.CloseHandleIfValid(stderrHandle);
+                    AgentSessionPersistence.ClearLiveTransport();
+                    try { p.Dispose(); } catch { }
+                    return;
+                }
+
+                if (!Win32HandleUtil.TryCreateReaderFromHandle(stdoutHandle, out var reader) ||
+                    !Win32HandleUtil.TryCreateWriterFromHandle(stdinHandle, out var writer) ||
+                    !Win32HandleUtil.TryCreateReaderFromHandle(stderrHandle, out var stderrReader))
+                {
+                    Win32HandleUtil.CloseHandleIfValid(stdinHandle);
+                    Win32HandleUtil.CloseHandleIfValid(stdoutHandle);
+                    Win32HandleUtil.CloseHandleIfValid(stderrHandle);
+                    AgentSessionPersistence.ClearLiveTransport();
+                    try { p.Dispose(); } catch { }
+                    return;
+                }
+
+                // From here on, the created streams own the duplicated handles.
+                AgentSessionPersistence.ClearLiveTransport();
+
+                agentProcess = p;
+                agentStdoutReader = reader;
+                agentStdinWriter = writer;
+                agentStderrReader = stderrReader;
+
+                StartDrainAgentStderr(agentStderrReader);
+
+                conn = new ClientSideConnection(_ => this, agentStdoutReader, agentStdinWriter, requestIdSeed);
+                conn.Open();
+
+                sessionId = AgentSessionPersistence.GetSessionId();
+                connectionStatus = ConnectionStatus.Success;
+                isConnecting = false;
+                isRunning = false;
+                shouldInjectHistoryIntoPrompts = false;
+
+                Logger.LogVerbose($"Reattached to existing agent process after domain reload (pid={pid}).");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning($"Failed to restore live transport: {ex.Message}");
+            }
+#endif
+        }
+
+        void StartDrainAgentStderr(StreamReader stderr)
+        {
+            if (stderr == null) return;
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    var text = stderr.ReadToEnd();
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        // Keep agent alive across reload: do not treat stderr as fatal; just surface it.
+                        UnityEngine.Debug.LogWarning(text);
+                    }
+                }
+                catch
+                {
+                    // ignore (process likely exited / pipe closed / domain reload)
+                }
+            }).Forget();
         }
 
         async Task ConnectAsync(AgentSettings config, CancellationToken cancellationToken = default)
@@ -392,25 +586,14 @@ namespace UnityAgentClient
 
                 agentProcess = Process.Start(startInfo);
 
-                // Consume stderr so the process won't block on a full buffer.
-                Task.Run(() =>
-                {
-                    try
-                    {
-                        var line = agentProcess.StandardError.ReadToEnd();
-                        if (!string.IsNullOrEmpty(line))
-                        {
-                            UnityEngine.Debug.LogError(line);
-                            EnqueueUi(() => connectionStatus = ConnectionStatus.Failed);
-                        }
-                    }
-                    catch
-                    {
-                        // ignore (process likely died or reload is happening)
-                    }
-                }, ct).Forget();
+                agentStdoutReader = agentProcess.StandardOutput;
+                agentStdinWriter = agentProcess.StandardInput;
+                agentStderrReader = agentProcess.StandardError;
 
-                conn = new ClientSideConnection(_ => this, agentProcess.StandardOutput, agentProcess.StandardInput);
+                // Consume stderr so the process won't block or crash on EPIPE when the editor reloads.
+                StartDrainAgentStderr(agentStderrReader);
+
+                conn = new ClientSideConnection(_ => this, agentStdoutReader, agentStdinWriter, initialRequestId: 0);
                 conn.Open();
 
                 Logger.LogVerbose("Connecting...");
@@ -462,7 +645,10 @@ namespace UnityAgentClient
                 SessionModeState? modesState = null;
                 var loadedExistingSession = false;
 
-                if (!string.IsNullOrWhiteSpace(persistedSessionId))
+                var sessionLoadUnsupported = AgentSessionPersistence.IsSessionLoadUnsupported();
+                Logger.LogVerbose($"Session load unsupported: {sessionLoadUnsupported}");
+
+                if (!sessionLoadUnsupported && !string.IsNullOrWhiteSpace(persistedSessionId))
                 {
                     try
                     {
@@ -477,6 +663,11 @@ namespace UnityAgentClient
                         modesState = loadRes.Modes;
                         loadedExistingSession = true;
                         Logger.LogVerbose($"Session loaded ({newSessionId}).");
+                    }
+                    catch (AcpException ex) when (ex.Code == JsonRpcMethodNotFoundCode)
+                    {
+                        AgentSessionPersistence.MarkSessionLoadUnsupported();
+                        Logger.LogWarning($"Agent does not support session/load; falling back to session/new. ({ex.Message})");
                     }
                     catch (Exception ex)
                     {
@@ -1385,7 +1576,26 @@ namespace UnityAgentClient
                 inputText = "";
                 attachedAssets.Clear(); // Clear attachments after sending
 
-                await conn.PromptAsync(request, operationCts.Token);
+                try
+                {
+                    await conn.PromptAsync(request, operationCts.Token);
+                }
+                catch (IOException ioEx)
+                {
+                    // Win32 error 232 (ERROR_NO_DATA) / broken pipe can happen if the agent process exited or a pipe got closed
+                    // during/after domain reload. Recover by disconnecting so OnGUI can reconnect.
+                    Logger.LogWarning($"Prompt failed due to I/O error: {ioEx.Message}");
+                    EnqueueUi(() => connectionStatus = ConnectionStatus.Failed);
+                    Disconnect(killAgentProcess: true);
+                    return;
+                }
+                catch (ObjectDisposedException odEx)
+                {
+                    Logger.LogWarning($"Prompt failed (disposed): {odEx.Message}");
+                    EnqueueUi(() => connectionStatus = ConnectionStatus.Failed);
+                    Disconnect(killAgentProcess: true);
+                    return;
+                }
 
                 // Once we've injected history successfully, stop doing it for subsequent prompts in this session.
                 shouldInjectHistoryIntoPrompts = false;

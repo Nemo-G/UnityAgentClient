@@ -13,7 +13,7 @@ public sealed class ClientSideConnection : IDisposable, IAcpAgent
     readonly CancellationTokenSource cts = new();
     readonly JsonRpcEndpoint endpoint;
 
-    public ClientSideConnection(Func<IAcpAgent, IAcpClient> toClient, TextReader reader, TextWriter writer)
+    public ClientSideConnection(Func<IAcpAgent, IAcpClient> toClient, TextReader reader, TextWriter writer, int initialRequestId = 0)
     {
         client = toClient(this);
 
@@ -24,7 +24,8 @@ public sealed class ClientSideConnection : IDisposable, IAcpAgent
                 writer.WriteLine(s);
                 return default;
             },
-            (s, _) => default
+            (s, _) => default,
+            initialRequestId
         );
 
         endpoint.SetRequestHandler(ClientMethods.FsReadTextFile, async (request, ct) =>

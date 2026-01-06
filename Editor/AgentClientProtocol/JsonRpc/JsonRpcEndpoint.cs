@@ -26,16 +26,18 @@ internal sealed class JsonRpcEndpoint
     readonly ConcurrentDictionary<string, Func<JsonRpcNotification, CancellationToken, ValueTask>> notificationHandlers = new();
     Func<JsonRpcRequest, CancellationToken, ValueTask<JsonRpcResponse>>? defaultRequestHandler;
     Func<JsonRpcNotification, CancellationToken, ValueTask>? defaultNotificationHandler;
-    int nextRequestId = 0;
+    int nextRequestId;
 
     public JsonRpcEndpoint(
         Func<CancellationToken, ValueTask<string?>> readFunc,
         Func<string, CancellationToken, ValueTask> writeFunc,
-        Func<string, CancellationToken, ValueTask> errorWriteFunc)
+        Func<string, CancellationToken, ValueTask> errorWriteFunc,
+        int initialRequestId = 0)
     {
         this.readFunc = readFunc;
         this.writeFunc = writeFunc;
         this.errorWriteFunc = errorWriteFunc;
+        nextRequestId = initialRequestId;
     }
 
     public void SetRequestHandler(string method, Func<JsonRpcRequest, CancellationToken, ValueTask<JsonRpcResponse>> handler)

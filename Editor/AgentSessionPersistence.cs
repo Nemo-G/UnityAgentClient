@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Diagnostics;
 using AgentClientProtocol;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
@@ -13,7 +14,7 @@ namespace UnityAgentClient
     /// </summary>
     internal static class AgentSessionPersistence
     {
-        const int CurrentVersion = 1;
+        const int CurrentVersion = 2;
 
         [Serializable]
         sealed class AgentSessionStateFile
@@ -22,6 +23,15 @@ namespace UnityAgentClient
             public string SessionId;
             public string MessagesJson;
             public string LastUpdatedUtc;
+
+            // Live process/stdio handoff for domain reload (Windows-only; valid only within the same Unity process).
+            public int UnityPid;
+            public int AgentPid;
+            public long AgentStdinHandle;
+            public long AgentStdoutHandle;
+            public long AgentStderrHandle;
+            public int JsonRpcRequestIdSeed;
+            public bool SessionLoadUnsupported;
         }
 
         static readonly object fileLock = new();
@@ -32,6 +42,19 @@ namespace UnityAgentClient
             return LoadState().SessionId;
         }
 
+        public static bool IsSessionLoadUnsupported()
+        {
+            return LoadState().SessionLoadUnsupported;
+        }
+
+        public static void MarkSessionLoadUnsupported()
+        {
+            var s = LoadState();
+            s.SessionLoadUnsupported = true;
+            s.LastUpdatedUtc = DateTime.UtcNow.ToString("o");
+            SaveState(s);
+        }
+
         public static void SetSessionId(string sessionId)
         {
             if (string.IsNullOrWhiteSpace(sessionId)) return;
@@ -39,6 +62,52 @@ namespace UnityAgentClient
             var s = LoadState();
             s.Version = CurrentVersion;
             s.SessionId = sessionId;
+            s.LastUpdatedUtc = DateTime.UtcNow.ToString("o");
+            SaveState(s);
+        }
+
+        public static void SaveLiveTransport(int agentPid, long stdinHandle, long stdoutHandle, long stderrHandle, int requestIdSeed)
+        {
+            var s = LoadState();
+            s.UnityPid = Process.GetCurrentProcess().Id;
+            s.AgentPid = agentPid;
+            s.AgentStdinHandle = stdinHandle;
+            s.AgentStdoutHandle = stdoutHandle;
+            s.AgentStderrHandle = stderrHandle;
+            s.JsonRpcRequestIdSeed = requestIdSeed;
+            s.LastUpdatedUtc = DateTime.UtcNow.ToString("o");
+            SaveState(s);
+        }
+
+        public static bool TryGetLiveTransport(out int agentPid, out long stdinHandle, out long stdoutHandle, out long stderrHandle, out int requestIdSeed)
+        {
+            agentPid = 0;
+            stdinHandle = 0;
+            stdoutHandle = 0;
+            stderrHandle = 0;
+            requestIdSeed = 0;
+
+            var s = LoadState();
+            if (s.UnityPid == 0 || s.UnityPid != Process.GetCurrentProcess().Id) return false;
+            if (s.AgentPid == 0 || s.AgentStdinHandle == 0 || s.AgentStdoutHandle == 0 || s.AgentStderrHandle == 0) return false;
+
+            agentPid = s.AgentPid;
+            stdinHandle = s.AgentStdinHandle;
+            stdoutHandle = s.AgentStdoutHandle;
+            stderrHandle = s.AgentStderrHandle;
+            requestIdSeed = s.JsonRpcRequestIdSeed;
+            return true;
+        }
+
+        public static void ClearLiveTransport()
+        {
+            var s = LoadState();
+            s.UnityPid = 0;
+            s.AgentPid = 0;
+            s.AgentStdinHandle = 0;
+            s.AgentStdoutHandle = 0;
+            s.AgentStderrHandle = 0;
+            s.JsonRpcRequestIdSeed = 0;
             s.LastUpdatedUtc = DateTime.UtcNow.ToString("o");
             SaveState(s);
         }
